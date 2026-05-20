@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+
+# TypeScript build output
+lib/
+
+# Test output
+coverage/
+.nyc_output/
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Env
+.env
+.env.local
+.env.*.local
+
+# NOTE: dist/ IS committed — GitHub Actions runs dist/index.js directly.

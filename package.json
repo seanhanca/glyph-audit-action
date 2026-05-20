@@ -1,0 +1,24 @@
+{
+  "name": "glyph-audit-action",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Audit chart specs on every PR. Posts a sticky comment with diff, audit findings, trust score, before/after SVGs.",
+  "scripts": {
+    "build": "ncc build src/main.ts -o dist --license licenses.txt",
+    "lint": "tsc --noEmit && eslint src tests",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@actions/core": "^1.10.0",
+    "@actions/exec": "^1.1.1",
+    "@actions/github": "^6.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "@vercel/ncc": "^0.38",
+    "eslint": "^9",
+    "typescript": "^5.6",
+    "vitest": "^2"
+  }
+}
