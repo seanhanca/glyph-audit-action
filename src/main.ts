@@ -5,7 +5,13 @@ import * as core from "@actions/core";
 import { getExecOutput } from "@actions/exec";
 import * as github from "@actions/github";
 import { findChangedSpecs } from "./detect.js";
+import { replaceMarkdownLinkTarget } from "./markdown.js";
 import { renderSpecDiff } from "./render.js";
+import { uploadSvgsToBranch } from "./upload.js";
+
+// Branch we commit rendered SVGs to. Hardcoded for now — PR6 may expose
+// this as an action input if real usage demands it.
+const AUDIT_BRANCH = ".glyph-audit";
 
 async function run(): Promise<void> {
   try {
@@ -101,14 +107,46 @@ async function run(): Promise<void> {
             exec: getExecOutput,
           });
 
+          // Upload the rendered SVGs to the orphan `.glyph-audit` branch and
+          // rewrite the local-path references inside the CLI's markdown to
+          // point at the resulting raw URLs. PR5 will use this rewritten
+          // markdown as the sticky-comment body. We do this even when no
+          // images came back so the comment still renders (it just won't
+          // have a Render section).
+          let markdown = render.markdown;
+          if (render.imagePaths.length > 0) {
+            const urls = await uploadSvgsToBranch({
+              octokit,
+              owner,
+              repo,
+              branch: AUDIT_BRANCH,
+              commitSha: headSha,
+              svgPaths: render.imagePaths,
+            });
+            // The CLI emits markdown like `![alt](before.svg)` with
+            // basename-only refs (the image-dir is its own scope). We MUST
+            // anchor the rewrite to the markdown image-link form `](X)` —
+            // a substring `before.svg` could otherwise show up in a JSON
+            // diff line, a code fence, or the user's own spec path (e.g.
+            // `charts/before.svg.glyph.json`) and would be incorrectly
+            // clobbered into a raw URL.
+            for (const [local, url] of Object.entries(urls)) {
+              const base = local.split("/").pop();
+              // Replace `](basename)` → `](url)` and `](abs/path)` → `](url)`.
+              // Anchoring on the `](...)` enclosure prevents collateral hits.
+              markdown = replaceMarkdownLinkTarget(markdown, local, url);
+              if (base) {
+                markdown = replaceMarkdownLinkTarget(markdown, base, url);
+              }
+            }
+            core.info(`Uploaded ${render.imagePaths.length} image(s) to ${AUDIT_BRANCH}.`);
+          } else {
+            core.info(`No images rendered for ${spec.path}; comment will be text-only.`);
+          }
+
           core.info(`--- glyph diff for ${spec.path} ---`);
-          core.info(render.markdown);
-          core.info(
-            `Rendered ${render.imagePaths.length} image(s) to ${imageDir} ` +
-              "(PR4 will upload them).",
-          );
-          // PR4 uploads `render.imagePaths`, rewrites `render.markdown` URLs;
-          // PR5 upserts the sticky PR comment.
+          core.info(markdown);
+          // PR5 will replace this `core.info` with a sticky PR-comment upsert.
         } catch (specErr) {
           // One spec failing shouldn't kill the whole action — we want the
           // remaining specs in the PR to still produce comments.
