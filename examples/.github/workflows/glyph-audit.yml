@@ -21,10 +21,16 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-      - run: npm install -g @glyph/cli
+      # Pin @glyph/cli to a known-good minor so a future breaking change
+      # doesn't surprise the workflow. Match the version your local
+      # `glyph diff` tests passed against. Bump deliberately.
+      - run: npm install -g @glyph/cli@0.1
       - uses: seanhanca/glyph-audit-action@v1
         with:
           spec-pattern: "**/*.glyph.json"
-          glyph-version: latest
+          # `glyph-version` here mirrors the install above; the action uses
+          # it as a label for log output (the actual binary on PATH already
+          # came from the npm install). Keep both in sync when bumping.
+          glyph-version: "0.1"
           fail-on: error
           comment-mode: sticky
