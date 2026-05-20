@@ -1,12 +1,18 @@
 import * as core from "@actions/core";
 import * as github from "@actions/github";
-import { findChangedSpecPairs } from "./detect.js";
+import { findChangedSpecs } from "./detect.js";
 
 async function run(): Promise<void> {
   try {
     const token = core.getInput("github-token") || process.env.GITHUB_TOKEN;
     if (!token) {
-      core.info("No GITHUB_TOKEN provided — skipping.");
+      // core.warning (not info) so the misconfiguration surfaces as an
+      // annotation in the Actions UI — otherwise a workflow without a token
+      // passes silently and the user wonders why the bot never comments.
+      core.warning(
+        "No GITHUB_TOKEN available. Set permissions.pull-requests to write " +
+          "on the workflow job, or pass a token via the `github-token` input.",
+      );
       return;
     }
     const octokit = github.getOctokit(token);
@@ -25,7 +31,7 @@ async function run(): Promise<void> {
     const changed = files.map((f) => f.filename);
 
     const pattern = core.getInput("spec-pattern") || "**/*.glyph.json";
-    const specs = findChangedSpecPairs({
+    const specs = findChangedSpecs({
       changedFiles: changed,
       pattern,
     });
