@@ -31702,6 +31702,64 @@ var core = __nccwpck_require__(6966);
 var exec = __nccwpck_require__(2851);
 // EXTERNAL MODULE: ./node_modules/.pnpm/@actions+github@6.0.1/node_modules/@actions/github/lib/github.js
 var github = __nccwpck_require__(4903);
+;// CONCATENATED MODULE: ./src/comment.ts
+/**
+ * Hidden HTML-comment marker we prepend to every sticky comment. GitHub's
+ * markdown renderer drops HTML comments, so it's invisible to readers but
+ * trivially findable on the next run.
+ *
+ * The string is intentionally namespaced so it won't collide with markers
+ * other audit bots use. We anchor matches to the START of the comment body
+ * (see {@link upsertComment}) so a user manually quoting our marker in
+ * their own comment can't trick us into editing it.
+ */
+const STICKY_MARKER = "<!-- glyph-audit-action:sticky -->";
+/**
+ * Post-or-update the action's PR comment.
+ *
+ * In `sticky` mode we paginate `listComments` (a busy PR can easily push
+ * past the 100-per-page default) and look for any comment whose body STARTS
+ * with our hidden marker. The strict prefix check guards against the edge
+ * case where a user pastes our marker text into their own comment — we'd
+ * otherwise clobber their content on the next push.
+ */
+async function upsertComment(args) {
+    const fullBody = `${STICKY_MARKER}\n\n${args.body}`;
+    if (args.mode === "new") {
+        await args.octokit.rest.issues.createComment({
+            owner: args.owner,
+            repo: args.repo,
+            issue_number: args.prNumber,
+            body: fullBody,
+        });
+        return;
+    }
+    const existing = await args.octokit.paginate(args.octokit.rest.issues.listComments, {
+        owner: args.owner,
+        repo: args.repo,
+        issue_number: args.prNumber,
+        per_page: 100,
+    });
+    // Anchor on prefix, not `includes`, so a user quoting our marker in their
+    // own comment can't be mistaken for our sticky comment.
+    const ours = existing.find((c) => typeof c.body === "string" && c.body.startsWith(STICKY_MARKER));
+    if (ours) {
+        await args.octokit.rest.issues.updateComment({
+            owner: args.owner,
+            repo: args.repo,
+            comment_id: ours.id,
+            body: fullBody,
+        });
+        return;
+    }
+    await args.octokit.rest.issues.createComment({
+        owner: args.owner,
+        repo: args.repo,
+        issue_number: args.prNumber,
+        body: fullBody,
+    });
+}
+
 ;// CONCATENATED MODULE: ./node_modules/.pnpm/balanced-match@4.0.4/node_modules/balanced-match/dist/esm/index.js
 const balanced = (a, b, str) => {
     const ma = a instanceof RegExp ? maybeMatch(a, str) : a;
@@ -34349,6 +34407,7 @@ function isNotFoundError(err) {
 
 
 
+
 // Branch we commit rendered SVGs to. Hardcoded for now — PR6 may expose
 // this as an action input if real usage demands it.
 const AUDIT_BRANCH = ".glyph-audit";
@@ -34399,6 +34458,19 @@ async function run() {
         // colliding when a PR touches more than one chart. Cleaned in `finally`
         // below so self-hosted runners don't accumulate per-PR detritus.
         const workRoot = (0,external_node_fs_namespaceObject.mkdtempSync)((0,external_node_path_namespaceObject.join)((0,external_node_os_namespaceObject.tmpdir)(), "glyph-audit-"));
+        // Validate `comment-mode` early so a typo surfaces as a clear failure
+        // instead of being silently coerced to `new` downstream. The default in
+        // `action.yml` is `sticky`, so empty-string here also resolves to sticky.
+        const commentModeInput = (core.getInput("comment-mode") || "sticky").trim();
+        if (commentModeInput !== "sticky" && commentModeInput !== "new") {
+            core.warning(`Unknown comment-mode "${commentModeInput}" — falling back to "sticky". ` +
+                'Valid values: "sticky" | "new".');
+        }
+        const commentMode = commentModeInput === "new" ? "new" : "sticky";
+        // Accumulator: one section of markdown per successfully-processed spec.
+        // We emit ONE comment per run (sticky-upsert or new-create) at the end —
+        // not one per spec — so a PR touching 5 charts produces 1 comment, not 5.
+        const sections = [];
         try {
             for (const spec of specs) {
                 try {
@@ -34470,7 +34542,10 @@ async function run() {
                     }
                     core.info(`--- glyph diff for ${spec.path} ---`);
                     core.info(markdown);
-                    // PR5 will replace this `core.info` with a sticky PR-comment upsert.
+                    // Accumulate; the comment is upserted ONCE after the loop. We
+                    // include the spec path as a `<h2>` so multi-chart PRs get a
+                    // navigable, scannable comment instead of a wall of diffs.
+                    sections.push(`## \`${spec.path}\`\n\n${markdown}`);
                 }
                 catch (specErr) {
                     // One spec failing shouldn't kill the whole action — we want the
@@ -34487,6 +34562,25 @@ async function run() {
                 // Ignore — cleanup is best-effort.
             });
         }
+        // Skip the comment entirely when EVERY spec failed — there's nothing
+        // useful to post, and a "0 charts rendered" comment would be noise. The
+        // per-spec warnings already surfaced as Actions annotations.
+        if (sections.length === 0) {
+            core.info("No spec sections produced — skipping PR comment.");
+            return;
+        }
+        const header = `### Glyph chart audit\n\n` +
+            `Rendered **${sections.length}** chart spec${sections.length === 1 ? "" : "s"} ` +
+            `at \`${headSha.slice(0, 7)}\`.`;
+        const body = [header, ...sections].join("\n\n---\n\n");
+        await upsertComment({
+            octokit,
+            owner,
+            repo,
+            prNumber: pr.number,
+            body,
+            mode: commentMode,
+        });
     }
     catch (err) {
         core.setFailed(err instanceof Error ? err.message : String(err));
