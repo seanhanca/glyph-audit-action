@@ -34154,14 +34154,23 @@ function findChangedSpecs({ changedFiles, pattern, }) {
  */
 async function renderSpecDiff(args) {
     await external_node_fs_namespaceObject.promises.mkdir(args.imageDir, { recursive: true });
-    const { stdout } = await args.exec(args.glyphCmd, [
+    // `--` separator before the positional spec paths defends against a
+    // spec named `-x.glyph.json` (or future `--help`-shaped filenames)
+    // being parsed by the CLI as a flag.
+    const [cmd, ...cmdArgs] = args.glyphCmd;
+    if (cmd === undefined) {
+        throw new Error("renderSpecDiff: glyphCmd must contain at least one element");
+    }
+    const { stdout } = await args.exec(cmd, [
+        ...cmdArgs,
         "diff",
-        args.base,
-        args.head,
         "--format",
         "md",
         "--image-dir",
         args.imageDir,
+        "--",
+        args.base,
+        args.head,
     ], {
         // `getExecOutput` captures stdout/stderr for us regardless; setting
         // silent keeps the action log tidy when the CLI is chatty.
@@ -34222,54 +34231,71 @@ async function run() {
         }
         const baseSha = pr.base.sha;
         const headSha = pr.head.sha;
-        const glyphCmd = "glyph";
+        // Wire the `glyph-version` action input. When set, shell out via
+        // `npx -y @glyph/cli@<version>` so the workflow doesn't need a separate
+        // install step. "latest" or empty → assume `glyph` is already on PATH
+        // (the documented prereq for now).
+        const glyphVersion = core.getInput("glyph-version");
+        const glyphCmd = glyphVersion && glyphVersion !== "latest"
+            ? ["npx", "-y", `@glyph/cli@${glyphVersion}`]
+            : ["glyph"];
         // One workspace per action run; subdirs per spec keep image renders from
-        // colliding when a PR touches more than one chart.
+        // colliding when a PR touches more than one chart. Cleaned in `finally`
+        // below so self-hosted runners don't accumulate per-PR detritus.
         const workRoot = (0,external_node_fs_namespaceObject.mkdtempSync)((0,external_node_path_namespaceObject.join)((0,external_node_os_namespaceObject.tmpdir)(), "glyph-audit-"));
-        for (const spec of specs) {
-            try {
-                const safeName = spec.path.replace(/[^\w.-]+/g, "_");
-                const specWorkDir = (0,external_node_path_namespaceObject.join)(workRoot, safeName);
-                await external_node_fs_namespaceObject.promises.mkdir(specWorkDir, { recursive: true });
-                const basePath = (0,external_node_path_namespaceObject.join)(specWorkDir, "base.json");
-                const headPath = (0,external_node_path_namespaceObject.join)(specWorkDir, "head.json");
-                const imageDir = (0,external_node_path_namespaceObject.join)(specWorkDir, "images");
-                const baseContent = await fetchFileAtRef(octokit, owner, repo, baseSha, spec.path);
-                const headContent = await fetchFileAtRef(octokit, owner, repo, headSha, spec.path);
-                if (baseContent === null) {
-                    // New spec — no base to diff against. PR4 will widen this to a
-                    // "new chart" preview; for PR3 we just log + skip.
-                    core.info(`Spec ${spec.path} is new on this PR — skipping diff (no base).`);
-                    continue;
+        try {
+            for (const spec of specs) {
+                try {
+                    const safeName = spec.path.replace(/[^\w.-]+/g, "_");
+                    const specWorkDir = (0,external_node_path_namespaceObject.join)(workRoot, safeName);
+                    await external_node_fs_namespaceObject.promises.mkdir(specWorkDir, { recursive: true });
+                    const basePath = (0,external_node_path_namespaceObject.join)(specWorkDir, "base.json");
+                    const headPath = (0,external_node_path_namespaceObject.join)(specWorkDir, "head.json");
+                    const imageDir = (0,external_node_path_namespaceObject.join)(specWorkDir, "images");
+                    const baseContent = await fetchFileAtRef(octokit, owner, repo, baseSha, spec.path);
+                    const headContent = await fetchFileAtRef(octokit, owner, repo, headSha, spec.path);
+                    if (baseContent === null) {
+                        // New spec — no base to diff against. PR4 will widen this to a
+                        // "new chart" preview; for PR3 we just log + skip.
+                        core.info(`Spec ${spec.path} is new on this PR — skipping diff (no base).`);
+                        continue;
+                    }
+                    if (headContent === null) {
+                        // Spec was deleted on the PR — nothing to render.
+                        core.info(`Spec ${spec.path} was deleted on this PR — skipping.`);
+                        continue;
+                    }
+                    await external_node_fs_namespaceObject.promises.writeFile(basePath, baseContent, "utf8");
+                    await external_node_fs_namespaceObject.promises.writeFile(headPath, headContent, "utf8");
+                    const render = await renderSpecDiff({
+                        path: spec.path,
+                        base: basePath,
+                        head: headPath,
+                        glyphCmd,
+                        imageDir,
+                        exec: exec.getExecOutput,
+                    });
+                    core.info(`--- glyph diff for ${spec.path} ---`);
+                    core.info(render.markdown);
+                    core.info(`Rendered ${render.imagePaths.length} image(s) to ${imageDir} ` +
+                        "(PR4 will upload them).");
+                    // PR4 uploads `render.imagePaths`, rewrites `render.markdown` URLs;
+                    // PR5 upserts the sticky PR comment.
                 }
-                if (headContent === null) {
-                    // Spec was deleted on the PR — nothing to render.
-                    core.info(`Spec ${spec.path} was deleted on this PR — skipping.`);
-                    continue;
+                catch (specErr) {
+                    // One spec failing shouldn't kill the whole action — we want the
+                    // remaining specs in the PR to still produce comments.
+                    core.warning(`Failed to render diff for ${spec.path}: ` +
+                        (specErr instanceof Error ? specErr.message : String(specErr)));
                 }
-                await external_node_fs_namespaceObject.promises.writeFile(basePath, baseContent, "utf8");
-                await external_node_fs_namespaceObject.promises.writeFile(headPath, headContent, "utf8");
-                const render = await renderSpecDiff({
-                    path: spec.path,
-                    base: basePath,
-                    head: headPath,
-                    glyphCmd,
-                    imageDir,
-                    exec: exec.getExecOutput,
-                });
-                core.info(`--- glyph diff for ${spec.path} ---`);
-                core.info(render.markdown);
-                core.info(`Rendered ${render.imagePaths.length} image(s) to ${imageDir} ` +
-                    "(PR4 will upload them).");
-                // PR4 uploads `render.imagePaths`, rewrites `render.markdown` URLs;
-                // PR5 upserts the sticky PR comment.
             }
-            catch (specErr) {
-                // One spec failing shouldn't kill the whole action — we want the
-                // remaining specs in the PR to still produce comments.
-                core.warning(`Failed to render diff for ${spec.path}: ` +
-                    (specErr instanceof Error ? specErr.message : String(specErr)));
-            }
+        }
+        finally {
+            // Best-effort tmpdir cleanup. GitHub-hosted runners GC per-job, but
+            // self-hosted runners would otherwise accumulate one workspace per PR.
+            await external_node_fs_namespaceObject.promises.rm(workRoot, { recursive: true, force: true }).catch(() => {
+                // Ignore — cleanup is best-effort.
+            });
         }
     }
     catch (err) {

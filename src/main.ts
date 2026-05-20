@@ -47,65 +47,83 @@ async function run(): Promise<void> {
 
     const baseSha = pr.base.sha as string;
     const headSha = pr.head.sha as string;
-    const glyphCmd = "glyph";
+
+    // Wire the `glyph-version` action input. When set, shell out via
+    // `npx -y @glyph/cli@<version>` so the workflow doesn't need a separate
+    // install step. "latest" or empty → assume `glyph` is already on PATH
+    // (the documented prereq for now).
+    const glyphVersion = core.getInput("glyph-version");
+    const glyphCmd: string[] =
+      glyphVersion && glyphVersion !== "latest"
+        ? ["npx", "-y", `@glyph/cli@${glyphVersion}`]
+        : ["glyph"];
 
     // One workspace per action run; subdirs per spec keep image renders from
-    // colliding when a PR touches more than one chart.
+    // colliding when a PR touches more than one chart. Cleaned in `finally`
+    // below so self-hosted runners don't accumulate per-PR detritus.
     const workRoot = mkdtempSync(join(tmpdir(), "glyph-audit-"));
 
-    for (const spec of specs) {
-      try {
-        const safeName = spec.path.replace(/[^\w.-]+/g, "_");
-        const specWorkDir = join(workRoot, safeName);
-        await fs.mkdir(specWorkDir, { recursive: true });
+    try {
+      for (const spec of specs) {
+        try {
+          const safeName = spec.path.replace(/[^\w.-]+/g, "_");
+          const specWorkDir = join(workRoot, safeName);
+          await fs.mkdir(specWorkDir, { recursive: true });
 
-        const basePath = join(specWorkDir, "base.json");
-        const headPath = join(specWorkDir, "head.json");
-        const imageDir = join(specWorkDir, "images");
+          const basePath = join(specWorkDir, "base.json");
+          const headPath = join(specWorkDir, "head.json");
+          const imageDir = join(specWorkDir, "images");
 
-        const baseContent = await fetchFileAtRef(octokit, owner, repo, baseSha, spec.path);
-        const headContent = await fetchFileAtRef(octokit, owner, repo, headSha, spec.path);
+          const baseContent = await fetchFileAtRef(octokit, owner, repo, baseSha, spec.path);
+          const headContent = await fetchFileAtRef(octokit, owner, repo, headSha, spec.path);
 
-        if (baseContent === null) {
-          // New spec — no base to diff against. PR4 will widen this to a
-          // "new chart" preview; for PR3 we just log + skip.
-          core.info(`Spec ${spec.path} is new on this PR — skipping diff (no base).`);
-          continue;
+          if (baseContent === null) {
+            // New spec — no base to diff against. PR4 will widen this to a
+            // "new chart" preview; for PR3 we just log + skip.
+            core.info(`Spec ${spec.path} is new on this PR — skipping diff (no base).`);
+            continue;
+          }
+          if (headContent === null) {
+            // Spec was deleted on the PR — nothing to render.
+            core.info(`Spec ${spec.path} was deleted on this PR — skipping.`);
+            continue;
+          }
+
+          await fs.writeFile(basePath, baseContent, "utf8");
+          await fs.writeFile(headPath, headContent, "utf8");
+
+          const render = await renderSpecDiff({
+            path: spec.path,
+            base: basePath,
+            head: headPath,
+            glyphCmd,
+            imageDir,
+            exec: getExecOutput,
+          });
+
+          core.info(`--- glyph diff for ${spec.path} ---`);
+          core.info(render.markdown);
+          core.info(
+            `Rendered ${render.imagePaths.length} image(s) to ${imageDir} ` +
+              "(PR4 will upload them).",
+          );
+          // PR4 uploads `render.imagePaths`, rewrites `render.markdown` URLs;
+          // PR5 upserts the sticky PR comment.
+        } catch (specErr) {
+          // One spec failing shouldn't kill the whole action — we want the
+          // remaining specs in the PR to still produce comments.
+          core.warning(
+            `Failed to render diff for ${spec.path}: ` +
+              (specErr instanceof Error ? specErr.message : String(specErr)),
+          );
         }
-        if (headContent === null) {
-          // Spec was deleted on the PR — nothing to render.
-          core.info(`Spec ${spec.path} was deleted on this PR — skipping.`);
-          continue;
-        }
-
-        await fs.writeFile(basePath, baseContent, "utf8");
-        await fs.writeFile(headPath, headContent, "utf8");
-
-        const render = await renderSpecDiff({
-          path: spec.path,
-          base: basePath,
-          head: headPath,
-          glyphCmd,
-          imageDir,
-          exec: getExecOutput,
-        });
-
-        core.info(`--- glyph diff for ${spec.path} ---`);
-        core.info(render.markdown);
-        core.info(
-          `Rendered ${render.imagePaths.length} image(s) to ${imageDir} ` +
-            "(PR4 will upload them).",
-        );
-        // PR4 uploads `render.imagePaths`, rewrites `render.markdown` URLs;
-        // PR5 upserts the sticky PR comment.
-      } catch (specErr) {
-        // One spec failing shouldn't kill the whole action — we want the
-        // remaining specs in the PR to still produce comments.
-        core.warning(
-          `Failed to render diff for ${spec.path}: ` +
-            (specErr instanceof Error ? specErr.message : String(specErr)),
-        );
       }
+    } finally {
+      // Best-effort tmpdir cleanup. GitHub-hosted runners GC per-job, but
+      // self-hosted runners would otherwise accumulate one workspace per PR.
+      await fs.rm(workRoot, { recursive: true, force: true }).catch(() => {
+        // Ignore — cleanup is best-effort.
+      });
     }
   } catch (err) {
     core.setFailed(err instanceof Error ? err.message : String(err));

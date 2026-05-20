@@ -42,8 +42,12 @@ export interface RenderSpecDiffArgs {
   base: string;
   /** Path on disk to the head (post-PR) version of the spec. */
   head: string;
-  /** Command used to invoke the glyph CLI (usually just "glyph"). */
-  glyphCmd: string;
+  /**
+   * Argv to invoke the glyph CLI. Usually `["glyph"]` (when the CLI is
+   * on PATH) but the action wraps it as `["npx", "-y",
+   * "@glyph/cli@<version>"]` when the workflow pins `glyph-version`.
+   */
+  glyphCmd: string[];
   /** Directory the CLI will write before/after renders into. Created if missing. */
   imageDir: string;
   /** Injected for testability — `getExecOutput` from `@actions/exec` in prod. */
@@ -60,16 +64,25 @@ export interface RenderSpecDiffArgs {
 export async function renderSpecDiff(args: RenderSpecDiffArgs): Promise<RenderResult> {
   await fs.mkdir(args.imageDir, { recursive: true });
 
+  // `--` separator before the positional spec paths defends against a
+  // spec named `-x.glyph.json` (or future `--help`-shaped filenames)
+  // being parsed by the CLI as a flag.
+  const [cmd, ...cmdArgs] = args.glyphCmd;
+  if (cmd === undefined) {
+    throw new Error("renderSpecDiff: glyphCmd must contain at least one element");
+  }
   const { stdout } = await args.exec(
-    args.glyphCmd,
+    cmd,
     [
+      ...cmdArgs,
       "diff",
-      args.base,
-      args.head,
       "--format",
       "md",
       "--image-dir",
       args.imageDir,
+      "--",
+      args.base,
+      args.head,
     ],
     {
       // `getExecOutput` captures stdout/stderr for us regardless; setting
