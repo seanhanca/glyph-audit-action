@@ -1,0 +1,12 @@
+# Force LF line endings on text files so the `dist/index.js` freshness
+# gate in .github/workflows/release.yml doesn't false-positive on a
+# maintainer who clones on Windows with `core.autocrlf=true`. The bundle
+# is rebuilt + committed as part of every PR; a CRLF roundtrip would
+# silently dirty the file even when the content is identical.
+* text=auto eol=lf
+dist/** text eol=lf
+*.js text eol=lf
+*.ts text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.md text eol=lf

@@ -1,5 +1,5 @@
 name: "Glyph Chart Audit"
-description: "Audit chart specs on PRs — diff, audit rules, trust score, before/after renders."
+description: "Audit Glyph chart specs on every PR: JSON diff, audit findings, trust score, and before/after SVG renders."
 author: "seanhanca"
 branding:
   icon: bar-chart-2
