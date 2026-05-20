@@ -4,6 +4,7 @@ import { join } from "node:path";
 import * as core from "@actions/core";
 import { getExecOutput } from "@actions/exec";
 import * as github from "@actions/github";
+import { upsertComment } from "./comment.js";
 import { findChangedSpecs } from "./detect.js";
 import { replaceMarkdownLinkTarget } from "./markdown.js";
 import { renderSpecDiff } from "./render.js";
@@ -68,6 +69,23 @@ async function run(): Promise<void> {
     // colliding when a PR touches more than one chart. Cleaned in `finally`
     // below so self-hosted runners don't accumulate per-PR detritus.
     const workRoot = mkdtempSync(join(tmpdir(), "glyph-audit-"));
+
+    // Validate `comment-mode` early so a typo surfaces as a clear failure
+    // instead of being silently coerced to `new` downstream. The default in
+    // `action.yml` is `sticky`, so empty-string here also resolves to sticky.
+    const commentModeInput = (core.getInput("comment-mode") || "sticky").trim();
+    if (commentModeInput !== "sticky" && commentModeInput !== "new") {
+      core.warning(
+        `Unknown comment-mode "${commentModeInput}" — falling back to "sticky". ` +
+          'Valid values: "sticky" | "new".',
+      );
+    }
+    const commentMode: "sticky" | "new" = commentModeInput === "new" ? "new" : "sticky";
+
+    // Accumulator: one section of markdown per successfully-processed spec.
+    // We emit ONE comment per run (sticky-upsert or new-create) at the end —
+    // not one per spec — so a PR touching 5 charts produces 1 comment, not 5.
+    const sections: string[] = [];
 
     try {
       for (const spec of specs) {
@@ -146,7 +164,11 @@ async function run(): Promise<void> {
 
           core.info(`--- glyph diff for ${spec.path} ---`);
           core.info(markdown);
-          // PR5 will replace this `core.info` with a sticky PR-comment upsert.
+
+          // Accumulate; the comment is upserted ONCE after the loop. We
+          // include the spec path as a `<h2>` so multi-chart PRs get a
+          // navigable, scannable comment instead of a wall of diffs.
+          sections.push(`## \`${spec.path}\`\n\n${markdown}`);
         } catch (specErr) {
           // One spec failing shouldn't kill the whole action — we want the
           // remaining specs in the PR to still produce comments.
@@ -163,6 +185,29 @@ async function run(): Promise<void> {
         // Ignore — cleanup is best-effort.
       });
     }
+
+    // Skip the comment entirely when EVERY spec failed — there's nothing
+    // useful to post, and a "0 charts rendered" comment would be noise. The
+    // per-spec warnings already surfaced as Actions annotations.
+    if (sections.length === 0) {
+      core.info("No spec sections produced — skipping PR comment.");
+      return;
+    }
+
+    const header =
+      `### Glyph chart audit\n\n` +
+      `Rendered **${sections.length}** chart spec${sections.length === 1 ? "" : "s"} ` +
+      `at \`${headSha.slice(0, 7)}\`.`;
+    const body = [header, ...sections].join("\n\n---\n\n");
+
+    await upsertComment({
+      octokit,
+      owner,
+      repo,
+      prNumber: pr.number,
+      body,
+      mode: commentMode,
+    });
   } catch (err) {
     core.setFailed(err instanceof Error ? err.message : String(err));
   }
