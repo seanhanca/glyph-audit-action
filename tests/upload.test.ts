@@ -49,14 +49,25 @@ describe("uploadSvgsToBranch", () => {
     const before = makeSvg(workDir, "before.svg", "<svg>before</svg>");
     const after = makeSvg(workDir, "after.svg", "<svg>after</svg>");
 
+    // Per-content SHA dispatch (NOT mockResolvedValueOnce, which is order-
+    // dependent): upload.ts does its readFile + createBlob calls in parallel
+    // via Promise.all, so the order in which the stubbed function is invoked
+    // is non-deterministic. Keying the response off the request content keeps
+    // this test stable AND catches a real bug — if upload.ts ever assigned
+    // the wrong content to the wrong blob, the SHA mapping would drift.
     const stubs: Stubs = {
       // Branch already exists — getRef succeeds → parent commit found → updateRef path.
       getRef: vi.fn().mockResolvedValue({ data: { object: { sha: "parent-commit-sha" } } }),
       getCommit: vi.fn().mockResolvedValue({ data: { tree: { sha: "parent-tree-sha" } } }),
-      createBlob: vi
-        .fn()
-        .mockResolvedValueOnce({ data: { sha: "blob-sha-before" } })
-        .mockResolvedValueOnce({ data: { sha: "blob-sha-after" } }),
+      createBlob: vi.fn().mockImplementation(({ content }: { content: string }) => {
+        if (content === "<svg>before</svg>") {
+          return Promise.resolve({ data: { sha: "blob-sha-before" } });
+        }
+        if (content === "<svg>after</svg>") {
+          return Promise.resolve({ data: { sha: "blob-sha-after" } });
+        }
+        return Promise.reject(new Error(`unexpected blob content: ${content}`));
+      }),
       createTree: vi.fn().mockResolvedValue({ data: { sha: "new-tree-sha" } }),
       createCommit: vi.fn().mockResolvedValue({ data: { sha: "new-commit-sha" } }),
       createRef: vi.fn(),
@@ -165,6 +176,32 @@ describe("uploadSvgsToBranch", () => {
       sha: "commit-sha",
     });
     expect(stubs.updateRef).not.toHaveBeenCalled();
+  });
+
+  // Regression for the original `markdown.split(base).join(url)` substring-
+  // replace, which would clobber any token equal to `before.svg` — including
+  // a user's spec path or a JSON diff line — into a raw URL.
+  it("only rewrites markdown link targets that exactly match (no substring clobber)", async () => {
+    const { replaceMarkdownLinkTarget } = await import("../src/markdown.js");
+    const md = [
+      "## Glyph chart change",
+      "### Diff",
+      "```diff",
+      '- "path": "charts/before.svg.glyph.json"',
+      '+ "path": "charts/after.svg.glyph.json"',
+      "```",
+      "### Render",
+      "| before | after |",
+      "| ------ | ----- |",
+      "| ![before](before.svg) | ![after](after.svg) |",
+    ].join("\n");
+
+    const out = replaceMarkdownLinkTarget(md, "before.svg", "https://example/before.svg");
+    // Only the link target inside `]( ... )` should change.
+    expect(out).toContain("](https://example/before.svg)");
+    // The token inside the JSON diff line MUST be left alone — `before.svg.glyph.json`
+    // is the user's spec name, not the rendered image.
+    expect(out).toContain('"path": "charts/before.svg.glyph.json"');
   });
 
   it("returns an empty map (and skips every API call) when given no SVGs", async () => {

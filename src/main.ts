@@ -5,6 +5,7 @@ import * as core from "@actions/core";
 import { getExecOutput } from "@actions/exec";
 import * as github from "@actions/github";
 import { findChangedSpecs } from "./detect.js";
+import { replaceMarkdownLinkTarget } from "./markdown.js";
 import { renderSpecDiff } from "./render.js";
 import { uploadSvgsToBranch } from "./upload.js";
 
@@ -122,15 +123,20 @@ async function run(): Promise<void> {
               commitSha: headSha,
               svgPaths: render.imagePaths,
             });
-            // The CLI emits markdown like `![before](before.svg)` with
-            // basename-only refs (the image-dir is its own scope). Rewrite
-            // both the absolute path (defensive — in case the CLI ever
-            // changes) and the basename form.
+            // The CLI emits markdown like `![alt](before.svg)` with
+            // basename-only refs (the image-dir is its own scope). We MUST
+            // anchor the rewrite to the markdown image-link form `](X)` —
+            // a substring `before.svg` could otherwise show up in a JSON
+            // diff line, a code fence, or the user's own spec path (e.g.
+            // `charts/before.svg.glyph.json`) and would be incorrectly
+            // clobbered into a raw URL.
             for (const [local, url] of Object.entries(urls)) {
-              markdown = markdown.split(local).join(url);
               const base = local.split("/").pop();
+              // Replace `](basename)` → `](url)` and `](abs/path)` → `](url)`.
+              // Anchoring on the `](...)` enclosure prevents collateral hits.
+              markdown = replaceMarkdownLinkTarget(markdown, local, url);
               if (base) {
-                markdown = markdown.split(base).join(url);
+                markdown = replaceMarkdownLinkTarget(markdown, base, url);
               }
             }
             core.info(`Uploaded ${render.imagePaths.length} image(s) to ${AUDIT_BRANCH}.`);
