@@ -1,9 +1,0 @@
-allowBuilds:
-  esbuild: set this to true or false
-# Single-package "workspace" — exists only so pnpm's corepack-shimmed
-# install respects the allow-builds gate that pnpm 11 introduced.
-# Without this file, ncc + transitive native deps trigger a
-# confirmation prompt that breaks `pnpm install` in non-interactive
-# contexts (CI, agent sandboxes).
-onlyBuiltDependencies:
-  - esbuild
