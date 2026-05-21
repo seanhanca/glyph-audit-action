@@ -16,7 +16,11 @@ jobs:
       pull-requests: write
     steps:
       - uses: actions/checkout@v4
-      - uses: seanhanca/glyph-audit-action@v0.2
+      # Pinned to the explicit v0.2.0 tag. A floating `@v0.2` tag isn't
+      # created by the release workflow — only the exact version tag and
+      # the `@main` ref exist. Bump deliberately when v0.2.1 / v0.3.0
+      # publish (see the action's README for the latest stable).
+      - uses: seanhanca/glyph-audit-action@v0.2.0
         with:
           spec-pattern: "**/*.glyph.json"
           # Severity threshold for failing the workflow. `error` blocks the
