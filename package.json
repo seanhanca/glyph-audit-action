@@ -1,9 +1,9 @@
 {
   "name": "glyph-audit-action",
-  "version": "0.0.1",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "Audit chart specs on every PR. Posts a sticky comment with diff, audit findings, trust score, before/after SVGs.",
+  "description": "Audit chart specs on every PR. Posts a sticky comment with audit findings and a spec diff; optionally fails the build on a severity threshold.",
   "scripts": {
     "build": "ncc build src/main.ts -o dist --license licenses.txt",
     "lint": "tsc --noEmit && eslint src tests",

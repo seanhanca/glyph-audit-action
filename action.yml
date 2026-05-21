@@ -1,5 +1,5 @@
 name: "Glyph Chart Audit"
-description: "Audit Glyph chart specs on every PR: JSON diff, audit findings, trust score, and before/after SVG renders."
+description: "Audit Glyph chart specs on every PR — flags misleading axes, dual scales, log without disclosure, and more. Posts findings as a sticky comment; gates merges via configurable severity threshold."
 author: "seanhanca"
 branding:
   icon: bar-chart-2
@@ -9,18 +9,23 @@ inputs:
     description: "Glob pattern for chart spec files."
     required: false
     default: "**/*.glyph.json"
-  glyph-version:
-    description: "Version of @glyph/cli to use (default: latest)."
-    required: false
-    default: "latest"
   fail-on:
-    description: "Exit non-zero when an audit finding at this severity or higher is detected."
+    description: >-
+      Severity threshold that fails the workflow. One of:
+      `error` (default — fail on any HIGH finding) |
+      `warning` (fail on HIGH or MEDIUM) |
+      `any` (fail on any finding) |
+      `none` (comment-only — never fail).
     required: false
-    default: "none"
+    default: "error"
   comment-mode:
     description: "Comment style: sticky (one comment, edited) | new (a new comment per push)."
     required: false
     default: "sticky"
+  github-token:
+    description: "Token used to read PR files and post the comment. Defaults to GITHUB_TOKEN."
+    required: false
+    default: ${{ github.token }}
 runs:
   using: "node20"
   main: "dist/index.js"

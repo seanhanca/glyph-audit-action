@@ -1,6 +1,6 @@
 # Copy this file into your repo at `.github/workflows/glyph-audit.yml`.
 # It will run on every pull request and post a sticky comment with the chart
-# audit results (diff, findings, trust score, before/after renders).
+# audit findings + spec diff.
 #
 # See https://github.com/seanhanca/glyph-audit-action for full docs.
 name: Glyph audit
@@ -10,27 +10,18 @@ jobs:
   audit:
     runs-on: ubuntu-latest
     permissions:
-      # `contents: write` lets the action push rendered SVGs to an orphan
-      # `.glyph-audit` branch so the PR comment can embed them inline.
-      contents: write
+      # `pull-requests: write` lets the action upsert the sticky comment.
+      # The default token already carries `contents: read`, which is enough
+      # to fetch spec contents at the base + head SHAs.
       pull-requests: write
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-      # Pin @glyph/cli to a known-good minor so a future breaking change
-      # doesn't surprise the workflow. Match the version your local
-      # `glyph diff` tests passed against. Bump deliberately.
-      - run: npm install -g @glyph/cli@0.1
-      - uses: seanhanca/glyph-audit-action@v1
+      - uses: seanhanca/glyph-audit-action@v0.2
         with:
           spec-pattern: "**/*.glyph.json"
-          # `glyph-version` here mirrors the install above; the action uses
-          # it as a label for log output (the actual binary on PATH already
-          # came from the npm install). Keep both in sync when bumping.
-          glyph-version: "0.1"
+          # Severity threshold for failing the workflow. `error` blocks the
+          # PR on a HIGH finding (truncated axes, undisclosed log scales).
+          # Use `warning` to also block on MEDIUM, `any` to block on
+          # anything, or `none` for comment-only mode.
           fail-on: error
           comment-mode: sticky

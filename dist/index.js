@@ -31690,18 +31690,285 @@ module.exports = parseParams
 /************************************************************************/
 var __webpack_exports__ = {};
 
-;// CONCATENATED MODULE: external "node:fs"
-const external_node_fs_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("node:fs");
-;// CONCATENATED MODULE: external "node:os"
-const external_node_os_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("node:os");
-;// CONCATENATED MODULE: external "node:path"
-const external_node_path_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("node:path");
 // EXTERNAL MODULE: ./node_modules/.pnpm/@actions+core@1.11.1/node_modules/@actions/core/lib/core.js
 var core = __nccwpck_require__(6966);
-// EXTERNAL MODULE: ./node_modules/.pnpm/@actions+exec@1.1.1/node_modules/@actions/exec/lib/exec.js
-var exec = __nccwpck_require__(2851);
 // EXTERNAL MODULE: ./node_modules/.pnpm/@actions+github@6.0.1/node_modules/@actions/github/lib/github.js
 var github = __nccwpck_require__(4903);
+;// CONCATENATED MODULE: ./src/audit.ts
+/**
+ * Chart auditor — vendored from `@glyph/core/audit` for v0.2.
+ *
+ * The action used to subprocess out to `glyph diff` (which lived in the
+ * unpublished `@glyph/cli`). For v0.2 we drop the subprocess entirely and
+ * run the audit + diff in-process, so adopters get a zero-runtime-dep
+ * `dist/index.js`.
+ *
+ * This file is a 1:1 reimplementation of the rule set in
+ * `glyph/packages/core/src/audit/index.ts`. The signatures are stable; if
+ * we ever publish `@glyph/core` we can swap to importing it without a
+ * comment-format change.
+ *
+ * Rules implemented (matches @glyph/core@PR63):
+ *
+ *   AUDIT-01 (high)   Bar chart with y-axis not starting at 0.
+ *   AUDIT-02 (medium) Dual-axis layers — left + right y axes.
+ *   AUDIT-03 (high)   Log y scale without "log" in the title.
+ *   AUDIT-04 (medium) rowCount < 5 on a bar chart (sparse aggregation).
+ *   AUDIT-06 (low)    colorCardinality > 8 categories.
+ *   AUDIT-07 (low)    Aspect ratio < 0.5 or > 3.
+ *   AUDIT-08 (medium) Diverging palette without explicit midpoint.
+ *   AUDIT-09 (medium) Multi-layer bar chart with y domain crossing zero.
+ *
+ * Deterministic, no clock, no LLM. Same input → same output.
+ */
+/**
+ * Audit a spec, returning all findings sorted by severity desc, then rule_id.
+ * Pure function — same input → same output, no side effects.
+ */
+function auditSpec(input) {
+    const out = [];
+    const { spec } = input;
+    const layers = Array.isArray(spec.layers) ? spec.layers : [];
+    const title = typeof spec.title === "string" ? spec.title : undefined;
+    for (let i = 0; i < layers.length; i++) {
+        const layer = layers[i];
+        if (!isRecord(layer))
+            continue;
+        auditTruncatedYAxis(out, layer, i);
+        auditLogScaleDisclosure(out, layer, i, title);
+        auditDivergingPalette(out, layer, i);
+    }
+    auditDualAxis(out, layers);
+    auditExcessiveAggregation(out, layers, input.rowCount);
+    auditColorCount(out, input.colorCardinality);
+    auditAspectRatio(out, spec);
+    auditStackedNegatives(out, layers);
+    return out.sort((a, b) => {
+        const sa = severityRank(a.severity);
+        const sb = severityRank(b.severity);
+        if (sa !== sb)
+            return sb - sa;
+        return a.rule_id.localeCompare(b.rule_id);
+    });
+}
+function severityRank(s) {
+    return s === "high" ? 3 : s === "medium" ? 2 : 1;
+}
+// ---------------------------------------------------------------------------
+// Rule: AUDIT-01 — truncated y axis on a bar chart
+// ---------------------------------------------------------------------------
+function auditTruncatedYAxis(out, layer, idx) {
+    if (layer.mark !== "bar")
+        return;
+    const enc = pickRecord(layer.encoding);
+    const yCh = enc?.y;
+    const domain = channelDomain(yCh);
+    if (!domain)
+        return;
+    if (domain.length < 2)
+        return;
+    const lo = Number(domain[0]);
+    if (!Number.isFinite(lo))
+        return;
+    if (lo > 0) {
+        out.push({
+            rule_id: "AUDIT-01",
+            severity: "high",
+            message: `Layer ${idx}: bar chart y-axis domain starts at ${lo}, not 0 — bar heights misrepresent magnitude.`,
+            suggestion: "Set scale.domain to [0, max] or use a different mark (point/line) when a non-zero baseline is intentional.",
+            path: `/layers/${idx}/encoding/y`,
+        });
+    }
+}
+// ---------------------------------------------------------------------------
+// Rule: AUDIT-03 — log scale without disclosure
+// ---------------------------------------------------------------------------
+function auditLogScaleDisclosure(out, layer, idx, title) {
+    const enc = pickRecord(layer.encoding);
+    const yCh = enc?.y;
+    const scaleType = channelScaleType(yCh);
+    if (scaleType !== "log")
+        return;
+    const titleText = (title ?? "").toLowerCase();
+    if (titleText.includes("log") || titleText.includes("logarithmic"))
+        return;
+    out.push({
+        rule_id: "AUDIT-03",
+        severity: "high",
+        message: `Layer ${idx}: y axis uses a logarithmic scale but the chart title doesn't mention it.`,
+        suggestion: "Add 'log' to the title or annotate the axis so readers don't read it as linear.",
+        path: `/layers/${idx}/encoding/y`,
+    });
+}
+// ---------------------------------------------------------------------------
+// Rule: AUDIT-08 — diverging palette without explicit midpoint
+// ---------------------------------------------------------------------------
+function auditDivergingPalette(out, layer, idx) {
+    const enc = pickRecord(layer.encoding);
+    const colorCh = enc?.color;
+    if (!colorCh || typeof colorCh === "string")
+        return;
+    if (!isRecord(colorCh))
+        return;
+    const scale = pickRecord(colorCh.scale);
+    if (!scale)
+        return;
+    const scheme = typeof scale.scheme === "string" ? scale.scheme.toLowerCase() : "";
+    if (!/diverging|rdbu|brbg|prgn|piyg|puor|rdgy|rdylbu|rdylgn/.test(scheme))
+        return;
+    if (scale.midpoint !== undefined)
+        return;
+    out.push({
+        rule_id: "AUDIT-08",
+        severity: "medium",
+        message: `Layer ${idx}: diverging color palette ("${scheme}") used without an explicit midpoint.`,
+        suggestion: "Set color.scale.midpoint (typically 0) so readers know where the palette pivots.",
+        path: `/layers/${idx}/encoding/color/scale`,
+    });
+}
+// ---------------------------------------------------------------------------
+// Rule: AUDIT-02 — dual-axis layers
+// ---------------------------------------------------------------------------
+function auditDualAxis(out, layers) {
+    if (layers.length < 2)
+        return;
+    const sides = layers.map((l) => {
+        if (!isRecord(l))
+            return "left";
+        const enc = pickRecord(l.encoding);
+        const y = enc?.y;
+        if (!y || typeof y === "string")
+            return "left";
+        if (!isRecord(y))
+            return "left";
+        const scale = pickRecord(y.scale);
+        return scale?.side === "right" ? "right" : "left";
+    });
+    const hasLeft = sides.includes("left");
+    const hasRight = sides.includes("right");
+    if (hasLeft && hasRight) {
+        out.push({
+            rule_id: "AUDIT-02",
+            severity: "medium",
+            message: "Dual-axis chart: layers use both left and right y axes. Readers often misjudge magnitudes when the two scales differ.",
+            suggestion: "Prefer normalizing both series to a shared scale, or split into two stacked panels.",
+        });
+    }
+}
+// ---------------------------------------------------------------------------
+// Rule: AUDIT-04 — excessive aggregation
+// ---------------------------------------------------------------------------
+function auditExcessiveAggregation(out, layers, rowCount) {
+    if (rowCount === undefined || rowCount === 0)
+        return;
+    for (let i = 0; i < layers.length; i++) {
+        const layer = layers[i];
+        if (!isRecord(layer) || layer.mark !== "bar")
+            continue;
+        const enc = pickRecord(layer.encoding);
+        const xCh = enc?.x;
+        if (!xCh)
+            continue;
+        if (rowCount < 5) {
+            out.push({
+                rule_id: "AUDIT-04",
+                severity: "medium",
+                message: `Layer ${i}: only ${rowCount} underlying rows — bar chart aggregates lose statistical power below 5 samples per category.`,
+                suggestion: "Show the raw data as points or document the sample size in the chart subtitle.",
+                path: `/layers/${i}`,
+            });
+        }
+    }
+}
+// ---------------------------------------------------------------------------
+// Rule: AUDIT-06 — too many colors
+// ---------------------------------------------------------------------------
+function auditColorCount(out, colorCardinality) {
+    if (colorCardinality === undefined)
+        return;
+    if (colorCardinality > 8) {
+        out.push({
+            rule_id: "AUDIT-06",
+            severity: "low",
+            message: `Color encoding uses ${colorCardinality} distinct categories — readers can't reliably distinguish more than ~8.`,
+            suggestion: "Group rarer categories under an 'Other' bucket, or facet by color instead of encoding it.",
+        });
+    }
+}
+// ---------------------------------------------------------------------------
+// Rule: AUDIT-07 — extreme aspect ratio
+// ---------------------------------------------------------------------------
+function auditAspectRatio(out, spec) {
+    const w = typeof spec.width === "number" ? spec.width : undefined;
+    const h = typeof spec.height === "number" ? spec.height : undefined;
+    if (w === undefined || h === undefined)
+        return;
+    if (h === 0)
+        return;
+    const ratio = w / h;
+    if (ratio < 0.5 || ratio > 3) {
+        out.push({
+            rule_id: "AUDIT-07",
+            severity: "low",
+            message: `Aspect ratio ${ratio.toFixed(2)} (${w}×${h}) is unusual; very tall or wide charts can exaggerate trends.`,
+            suggestion: "Keep width:height between 0.5 and 3 unless the data shape genuinely demands otherwise.",
+        });
+    }
+}
+// ---------------------------------------------------------------------------
+// Rule: AUDIT-09 — stacked layers crossing zero
+// ---------------------------------------------------------------------------
+function auditStackedNegatives(out, layers) {
+    for (let i = 0; i < layers.length; i++) {
+        const layer = layers[i];
+        if (!isRecord(layer) || layer.mark !== "bar")
+            continue;
+        const enc = pickRecord(layer.encoding);
+        const domain = channelDomain(enc?.y);
+        if (!domain || domain.length < 2)
+            continue;
+        const lo = Number(domain[0]);
+        const hi = Number(domain[domain.length - 1]);
+        if (!Number.isFinite(lo) || !Number.isFinite(hi))
+            continue;
+        if (lo < 0 && hi > 0 && layers.length > 1) {
+            out.push({
+                rule_id: "AUDIT-09",
+                severity: "medium",
+                message: `Layer ${i}: bar chart y domain crosses zero (${lo} → ${hi}) with multiple layers — stacking yields ambiguous totals.`,
+                suggestion: "Split into separate panels for positive and negative values, or use diverging color encoding.",
+                path: `/layers/${i}/encoding/y/scale/domain`,
+            });
+        }
+    }
+}
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+function isRecord(v) {
+    return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+function pickRecord(v) {
+    return isRecord(v) ? v : undefined;
+}
+function channelDomain(c) {
+    if (!c || typeof c === "string")
+        return undefined;
+    if (!isRecord(c))
+        return undefined;
+    const scale = pickRecord(c.scale);
+    const domain = scale?.domain;
+    return Array.isArray(domain) ? domain : undefined;
+}
+function channelScaleType(c) {
+    if (!c || typeof c === "string")
+        return undefined;
+    if (!isRecord(c))
+        return undefined;
+    const scale = pickRecord(c.scale);
+    return typeof scale?.type === "string" ? scale.type : undefined;
+}
+
 ;// CONCATENATED MODULE: ./src/comment.ts
 /**
  * Hidden HTML-comment marker we prepend to every sticky comment. GitHub's
@@ -34195,205 +34462,350 @@ minimatch.unescape = unescape_unescape;
 /**
  * Filter a list of changed file paths down to those that match the spec
  * glob pattern. Pure / side-effect free so it's easy to unit-test.
+ *
+ * v0.2 NOTE: the action no longer drives off `pulls.listFiles` (that
+ * silently dropped new specs). `findChangedSpecs` is kept as a helper
+ * for callers that legitimately want a CHANGED-files view, but `main.ts`
+ * uses the broader `matchesPattern` against every spec at HEAD.
  */
 function findChangedSpecs({ changedFiles, pattern, }) {
-    return changedFiles.filter((p) => minimatch(p, pattern)).map((p) => ({ path: p }));
+    return changedFiles.filter((p) => matchesPattern(p, pattern)).map((p) => ({ path: p }));
+}
+/** Single-path matcher — used by main.ts when filtering the git tree. */
+function matchesPattern(path, pattern) {
+    return minimatch(path, pattern);
 }
 
-;// CONCATENATED MODULE: ./src/markdown.ts
+;// CONCATENATED MODULE: ./src/format.ts
 /**
- * Anchored markdown link-target replacement.
+ * Markdown formatters for the sticky PR comment.
  *
- * `glyph diff --format md` emits image references shaped like
- * `![alt](before.svg)`. After uploading the SVGs to the orphan branch we
- * rewrite the `before.svg` / `after.svg` link target → the raw URL.
+ * One section per audited spec. The shape is:
  *
- * The naive `markdown.split(target).join(url)` approach is unsafe: it also
- * replaces any incidental occurrence of `before.svg`, including the user's
- * own spec path (e.g. `charts/before.svg.glyph.json`), a token inside a
- * JSON diff line, a column label, or a code fence. Anchoring the match on
- * the `](X)` enclosure prevents that collateral damage.
+ *   ## `<spec-path>`
  *
- * Exported separately from main.ts so the rest of main.ts (which runs
- * `octokit.paginate` etc. at module load via `run()`) doesn't show up as a
- * side-effecting import in tests that only need this helper.
+ *   <diff summary, if the spec changed on the PR>
+ *   <diff details, collapsed in <details>>
+ *
+ *   ### Audit findings
+ *   <N findings: X high, Y medium, Z low>
+ *   <markdown table: rule | severity | path | message>
+ *
+ * The sticky-comment header (the run-level `### Glyph chart audit ...` line
+ * and the separators between sections) is built in `main.ts`.
+ *
+ * Severity is rendered with all-caps text labels (`**HIGH**`), NOT emoji —
+ * adopter projects may grep / filter the comment body, and emoji breaks
+ * substring matches.
  */
-function replaceMarkdownLinkTarget(markdown, target, url) {
-    // Escape regex metachars in the target so a filename like `chart.svg`
-    // doesn't accidentally let `.` match any character.
-    const escaped = target.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    // The match group is `](TARGET)`; the URL form covers both image links
-    // (`![alt](url)`) and plain links (`[label](url)`). Trailing `)` stays
-    // inside the pattern so we keep the regex broadly portable.
-    const pattern = new RegExp(`\\]\\(${escaped}\\)`, "g");
-    return markdown.replace(pattern, `](${url})`);
-}
-
-;// CONCATENATED MODULE: ./src/render.ts
-
-
-/**
- * Shell out to `glyph diff <base> <head> --format md --image-dir <imageDir>`
- * and collect the markdown + every SVG written into the image dir.
- *
- * PR3 only wires the call + return shape; PR4 reads `imagePaths`, uploads
- * each SVG, and rewrites references inside `markdown`. PR5 posts the result.
- */
-async function renderSpecDiff(args) {
-    await external_node_fs_namespaceObject.promises.mkdir(args.imageDir, { recursive: true });
-    // `--` separator before the positional spec paths defends against a
-    // spec named `-x.glyph.json` (or future `--help`-shaped filenames)
-    // being parsed by the CLI as a flag.
-    const [cmd, ...cmdArgs] = args.glyphCmd;
-    if (cmd === undefined) {
-        throw new Error("renderSpecDiff: glyphCmd must contain at least one element");
+function countBySeverity(findings) {
+    const counts = { high: 0, medium: 0, low: 0, total: findings.length };
+    for (const f of findings) {
+        counts[f.severity]++;
     }
-    const { stdout } = await args.exec(cmd, [
-        ...cmdArgs,
-        "diff",
-        "--format",
-        "md",
-        "--image-dir",
-        args.imageDir,
-        "--",
-        args.base,
-        args.head,
-    ], {
-        // `getExecOutput` captures stdout/stderr for us regardless; setting
-        // silent keeps the action log tidy when the CLI is chatty.
-        silent: true,
+    return counts;
+}
+/**
+ * The summary line that goes above the findings table. Examples:
+ *
+ *   "**0 findings** — clean."
+ *   "**3 findings**: 1 HIGH, 1 MEDIUM, 1 LOW."
+ */
+function summaryLine(counts) {
+    if (counts.total === 0) {
+        return "**0 findings** — clean.";
+    }
+    const parts = [];
+    if (counts.high > 0)
+        parts.push(`${counts.high} HIGH`);
+    if (counts.medium > 0)
+        parts.push(`${counts.medium} MEDIUM`);
+    if (counts.low > 0)
+        parts.push(`${counts.low} LOW`);
+    return `**${counts.total} finding${counts.total === 1 ? "" : "s"}**: ${parts.join(", ")}.`;
+}
+/**
+ * Render the audit findings table for a single spec. Empty array → a
+ * "no issues" stub so the comment isn't a sea of blank sections.
+ */
+function renderFindingsTable(findings) {
+    if (findings.length === 0) {
+        return "_No audit findings._";
+    }
+    const header = `| Rule | Severity | Path | Message |\n| --- | --- | --- | --- |`;
+    const rows = findings.map((f) => {
+        const rule = escapeCell(f.rule_id);
+        const sev = `**${f.severity.toUpperCase()}**`;
+        const path = f.path ? `\`${escapeCell(f.path)}\`` : "—";
+        const msg = escapeCell(f.message);
+        return `| ${rule} | ${sev} | ${path} | ${msg} |`;
     });
-    const imagePaths = await listImages(args.imageDir);
-    return { path: args.path, markdown: stdout, imagePaths };
+    return [header, ...rows].join("\n");
 }
-async function listImages(dir) {
-    const entries = await external_node_fs_namespaceObject.promises.readdir(dir, { withFileTypes: true });
-    return entries
-        .filter((e) => e.isFile() && /\.(svg|png)$/i.test(e.name))
-        .map((e) => external_node_path_namespaceObject.join(dir, e.name))
-        .sort();
-}
-
-;// CONCATENATED MODULE: ./src/upload.ts
-
-
 /**
- * Upload a batch of locally-rendered SVGs to an orphan branch of the same
- * repository via the GitHub Git Data API (`git.createBlob` → `git.createTree`
- * → `git.createCommit` → `git.updateRef` / `git.createRef`).
- *
- * The branch (`.glyph-audit` by default) is kept orphan — it doesn't share
- * history with `main` — and each PR head SHA gets its own subdir so the
- * branch stays diff-clean and concurrent PRs can't collide. Each upload is a
- * single fast-forward commit on top of whatever's already there.
- *
- * Returns a `local-path → raw-URL` map. URLs are
- * `https://raw.githubusercontent.com/<owner>/<repo>/<branch>/<sha>/<file>.svg`,
- * which renders inline in GitHub PR comments **for public repos only** —
- * private repos require auth headers and raw URLs won't display. PR4
- * documents this limitation; PR5 / PR6 may revisit.
+ * Render the diff section (added / removed / changed) as a collapsible
+ * `<details>` block. Returns "" when the diff is empty.
  */
-async function uploadSvgsToBranch(args) {
-    const { octokit, owner, repo, branch, commitSha, svgPaths } = args;
-    if (svgPaths.length === 0) {
-        return {};
+function renderDiffSection(diff) {
+    if (diff.added.length === 0 &&
+        diff.removed.length === 0 &&
+        diff.changed.length === 0) {
+        return "";
     }
-    // 1. Read every SVG + push each as a blob. We do the reads in parallel
-    //    because they're disk I/O; the blob uploads we serialize behind the
-    //    reads but parallelize among themselves to stay polite to the API.
-    const blobs = await Promise.all(svgPaths.map(async (local) => {
-        const content = await external_node_fs_namespaceObject.promises.readFile(local, "utf8");
-        const blob = await octokit.rest.git.createBlob({
-            owner,
-            repo,
-            content,
-            encoding: "utf-8",
-        });
-        return {
-            local,
-            filename: external_node_path_namespaceObject.basename(local),
-            sha: blob.data.sha,
-        };
-    }));
-    // 2. Look up the current tip of the orphan branch (if any). 404 means the
-    //    branch doesn't exist yet — first PR for this repo to ever invoke the
-    //    action — so we'll createRef instead of updateRef below.
-    const ref = `heads/${branch}`;
-    let parentCommitSha = null;
-    let baseTreeSha;
-    try {
-        const refData = await octokit.rest.git.getRef({ owner, repo, ref });
-        parentCommitSha = refData.data.object.sha;
-        const parentCommit = await octokit.rest.git.getCommit({
-            owner,
-            repo,
-            commit_sha: parentCommitSha,
-        });
-        baseTreeSha = parentCommit.data.tree.sha;
+    const lines = ["<details>", "<summary>Spec diff</summary>", ""];
+    if (diff.summary) {
+        lines.push(`_${diff.summary}_`);
+        lines.push("");
     }
-    catch (err) {
-        if (!isNotFoundError(err)) {
-            throw err;
+    if (diff.changed.length > 0) {
+        lines.push("**Changed**");
+        lines.push("");
+        lines.push("```diff");
+        for (const c of diff.changed) {
+            lines.push(`- ${c.path}: ${formatVal(c.before)}`);
+            lines.push(`+ ${c.path}: ${formatVal(c.after)}`);
         }
-        // Branch missing — `baseTreeSha` stays undefined → orphan tree on first run.
+        lines.push("```");
+        lines.push("");
     }
-    // 3. Build a tree containing every SVG under `<commitSha>/<filename>`.
-    //    The path prefix is deliberate: it isolates this PR's renders from
-    //    every other PR's renders on the same orphan branch.
-    const tree = await octokit.rest.git.createTree({
-        owner,
-        repo,
-        base_tree: baseTreeSha,
-        tree: blobs.map((b) => ({
-            path: `${commitSha}/${b.filename}`,
-            mode: "100644",
-            type: "blob",
-            sha: b.sha,
-        })),
-    });
-    // 4. Commit the tree. The parent list is empty when the branch is brand
-    //    new (truly orphan); otherwise we fast-forward off the current tip.
-    const commit = await octokit.rest.git.createCommit({
-        owner,
-        repo,
-        message: `chore(audit): upload renders for ${commitSha}`,
-        tree: tree.data.sha,
-        parents: parentCommitSha ? [parentCommitSha] : [],
-    });
-    // 5. Move the branch tip. createRef for a brand-new branch, updateRef
-    //    otherwise. We force-update is intentionally NOT used — we always
-    //    fast-forward, so a non-FF would be a real bug worth surfacing.
-    if (parentCommitSha === null) {
-        await octokit.rest.git.createRef({
-            owner,
-            repo,
-            ref: `refs/heads/${branch}`,
-            sha: commit.data.sha,
-        });
+    if (diff.added.length > 0) {
+        lines.push("**Added**");
+        lines.push("");
+        lines.push("```diff");
+        for (const a of diff.added) {
+            lines.push(`+ ${a.path}: ${formatVal(a.value)}`);
+        }
+        lines.push("```");
+        lines.push("");
+    }
+    if (diff.removed.length > 0) {
+        lines.push("**Removed**");
+        lines.push("");
+        lines.push("```diff");
+        for (const r of diff.removed) {
+            lines.push(`- ${r.path}: ${formatVal(r.value)}`);
+        }
+        lines.push("```");
+        lines.push("");
+    }
+    lines.push("</details>");
+    return lines.join("\n");
+}
+/**
+ * Render a single spec's section: heading, optional diff, audit summary,
+ * findings table. The caller joins multiple sections with `\n\n---\n\n`.
+ */
+function renderSpecSection(args) {
+    const blocks = [`## \`${args.path}\``, ""];
+    if (args.diff === null) {
+        blocks.push("_New spec on this PR — no base version to diff against._");
+        blocks.push("");
     }
     else {
-        await octokit.rest.git.updateRef({
-            owner,
-            repo,
-            ref,
-            sha: commit.data.sha,
-        });
+        const diffMd = renderDiffSection(args.diff);
+        if (diffMd) {
+            blocks.push(diffMd);
+            blocks.push("");
+        }
+        else {
+            blocks.push("_No spec changes._");
+            blocks.push("");
+        }
     }
-    // 6. Build the local → raw-URL map. raw.githubusercontent.com serves
-    //    `<owner>/<repo>/<branch>/<path>`; branch names with a leading dot
-    //    (`.glyph-audit`) are fine here — no need to URL-encode the dot.
-    const urlMap = {};
-    for (const b of blobs) {
-        urlMap[b.local] =
-            `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${commitSha}/${b.filename}`;
-    }
-    return urlMap;
+    blocks.push("### Audit findings");
+    blocks.push("");
+    blocks.push(summaryLine(countBySeverity(args.findings)));
+    blocks.push("");
+    blocks.push(renderFindingsTable(args.findings));
+    return blocks.join("\n");
 }
-function isNotFoundError(err) {
-    return (err !== null &&
-        typeof err === "object" &&
-        "status" in err &&
-        err.status === 404);
+/**
+ * Parse the `fail-on` action input. Anything we don't recognize falls
+ * through to `"error"` (the v0.2 default — see action.yml). v0.1.0
+ * defaulted to `"none"`, but v0.1 never read the input — so adopters
+ * weren't relying on the prior default's behavior.
+ */
+function parseFailOn(raw) {
+    const v = (raw ?? "").trim().toLowerCase();
+    if (v === "error" || v === "warning" || v === "any" || v === "none") {
+        return v;
+    }
+    return "error";
+}
+/**
+ * Should the action exit non-zero given these findings and threshold?
+ *
+ *   `error`   — fail when ANY finding is `high`.
+ *   `warning` — fail when ANY finding is `high` OR `medium`.
+ *   `any`     — fail when there's any finding at all.
+ *   `none`    — never fail on findings (comment-only mode).
+ */
+function shouldFail(findings, level) {
+    if (level === "none")
+        return false;
+    if (level === "any")
+        return findings.length > 0;
+    if (level === "warning") {
+        return findings.some((f) => f.severity === "high" || f.severity === "medium");
+    }
+    // "error" — only high severity trips the build.
+    return findings.some((f) => f.severity === "high");
+}
+/**
+ * The human-readable failure reason. Used as the `core.setFailed` message
+ * so the Actions UI annotation explains WHY the run is red.
+ */
+function failureReason(findings, level) {
+    const c = countBySeverity(findings);
+    return (`Glyph audit gate: fail-on=${level}, findings=` +
+        `${c.high} high / ${c.medium} medium / ${c.low} low.`);
+}
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+/**
+ * Escape table-cell content so a `|` inside a message doesn't break the
+ * markdown table layout. Newlines collapse to spaces (cells can't contain
+ * a line break and stay in the same row).
+ */
+function escapeCell(s) {
+    return s.replace(/\\/g, "\\\\").replace(/\|/g, "\\|").replace(/\r?\n/g, " ");
+}
+function formatVal(v) {
+    if (typeof v === "string")
+        return JSON.stringify(v);
+    if (v === undefined)
+        return "undefined";
+    try {
+        return JSON.stringify(v);
+    }
+    catch {
+        return String(v);
+    }
+}
+
+;// CONCATENATED MODULE: ./src/spec-diff.ts
+/**
+ * Spec diff — vendored from `@glyph/core/spec-diff` for v0.2.
+ *
+ * Pure-fn structural diff between two Glyph specs (anything JSON-shaped,
+ * really). Returns added / removed / changed paths plus a one-sentence
+ * narrative summary.
+ *
+ * Used by `main.ts` when a spec exists at BOTH base and head SHAs (i.e.
+ * an edit, not a new-file). New specs skip the diff and surface the
+ * audit findings directly.
+ */
+/** Compute a structural diff between two Glyph specs. */
+function diffSpecs(a, b) {
+    const added = [];
+    const removed = [];
+    const changed = [];
+    walk(a, b, "", added, removed, changed);
+    const summary = buildSummary(added, removed, changed);
+    return { added, removed, changed, summary };
+}
+function walk(a, b, path, added, removed, changed) {
+    if (a === b)
+        return;
+    if (isObject(a) && isObject(b)) {
+        const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+        for (const k of keys) {
+            const childPath = `${path}/${escapePointer(k)}`;
+            const av = a[k];
+            const bv = b[k];
+            if (av === undefined && bv !== undefined) {
+                added.push({ path: childPath, value: bv });
+            }
+            else if (av !== undefined && bv === undefined) {
+                removed.push({ path: childPath, value: av });
+            }
+            else {
+                walk(av, bv, childPath, added, removed, changed);
+            }
+        }
+        return;
+    }
+    if (Array.isArray(a) && Array.isArray(b)) {
+        const max = Math.max(a.length, b.length);
+        for (let i = 0; i < max; i++) {
+            const childPath = `${path}/${i}`;
+            if (i >= a.length)
+                added.push({ path: childPath, value: b[i] });
+            else if (i >= b.length)
+                removed.push({ path: childPath, value: a[i] });
+            else
+                walk(a[i], b[i], childPath, added, removed, changed);
+        }
+        return;
+    }
+    if (!deepEqual(a, b)) {
+        changed.push({ path: path || "/", before: a, after: b });
+    }
+}
+function isObject(v) {
+    return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+function deepEqual(a, b) {
+    if (a === b)
+        return true;
+    if (Array.isArray(a) && Array.isArray(b)) {
+        if (a.length !== b.length)
+            return false;
+        for (let i = 0; i < a.length; i++) {
+            if (!deepEqual(a[i], b[i]))
+                return false;
+        }
+        return true;
+    }
+    if (isObject(a) && isObject(b)) {
+        const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+        for (const k of keys) {
+            if (!deepEqual(a[k], b[k]))
+                return false;
+        }
+        return true;
+    }
+    return false;
+}
+function escapePointer(s) {
+    return s.replace(/~/g, "~0").replace(/\//g, "~1");
+}
+function buildSummary(added, removed, changed) {
+    if (added.length === 0 && removed.length === 0 && changed.length === 0)
+        return "";
+    const parts = [];
+    const dataTransformChange = changed.find((c) => c.path.endsWith("/transform"));
+    if (dataTransformChange) {
+        parts.push(`data.transform changed (${truncate(String(dataTransformChange.before))} → ${truncate(String(dataTransformChange.after))})`);
+    }
+    const sourceChange = changed.find((c) => c.path === "/data/source");
+    if (sourceChange)
+        parts.push(`source: ${sourceChange.before} → ${sourceChange.after}`);
+    const layerAdds = added.filter((a) => /^\/layers\/\d+$/.test(a.path));
+    const layerRemoves = removed.filter((r) => /^\/layers\/\d+$/.test(r.path));
+    if (layerAdds.length > 0)
+        parts.push(`${layerAdds.length} layer(s) added`);
+    if (layerRemoves.length > 0)
+        parts.push(`${layerRemoves.length} layer(s) removed`);
+    const encChanges = changed.filter((c) => c.path.includes("/encoding/"));
+    if (encChanges.length > 0) {
+        const ch = encChanges[0];
+        if (ch) {
+            parts.push(`${pathTail(ch.path)} encoding ${ch.before === undefined ? "set" : "changed"}`);
+        }
+    }
+    if (parts.length === 0) {
+        parts.push(`${added.length} added, ${removed.length} removed, ${changed.length} changed`);
+    }
+    return `${parts.join("; ")}.`;
+}
+function pathTail(path) {
+    const parts = path.split("/");
+    return parts[parts.length - 1] ?? path;
+}
+function truncate(s, n = 40) {
+    return s.length > n ? `${s.slice(0, n - 1)}…` : s;
 }
 
 ;// CONCATENATED MODULE: ./src/main.ts
@@ -34404,20 +34816,25 @@ function isNotFoundError(err) {
 
 
 
-
-
-
-
-// Branch we commit rendered SVGs to. Hardcoded for now — PR6 may expose
-// this as an action input if real usage demands it.
-const AUDIT_BRANCH = ".glyph-audit";
+/**
+ * v0.2 redesign:
+ *
+ * - Audit runs for EVERY spec matching `spec-pattern`, NOT just the specs
+ *   touched by the PR (the v0.1.0 behavior, which silently skipped new
+ *   files — they had no base SHA to diff against).
+ * - Diff is still PR-scoped (you can only "diff" something that existed
+ *   before), but the audit section of the comment is always populated.
+ * - `fail-on` is honored. `core.setFailed` runs at the END so adopters
+ *   see the comment even on a red build.
+ * - No CLI subprocess. The audit + diff are vendored from `@glyph/core`
+ *   (see `src/audit.ts`, `src/spec-diff.ts`) and bundled into
+ *   `dist/index.js` by ncc. Adopter workflows no longer need
+ *   `npm install -g @glyph/cli`.
+ */
 async function run() {
     try {
         const token = core.getInput("github-token") || process.env.GITHUB_TOKEN;
         if (!token) {
-            // core.warning (not info) so the misconfiguration surfaces as an
-            // annotation in the Actions UI — otherwise a workflow without a token
-            // passes silently and the user wonders why the bot never comments.
             core.warning("No GITHUB_TOKEN available. Set permissions.pull-requests to write " +
                 "on the workflow job, or pass a token via the `github-token` input.");
             return;
@@ -34429,149 +34846,92 @@ async function run() {
             core.info("No PR context — skipping.");
             return;
         }
-        const files = await octokit.paginate(octokit.rest.pulls.listFiles, {
-            owner,
-            repo,
-            pull_number: pr.number,
-        });
-        const changed = files.map((f) => f.filename);
         const pattern = core.getInput("spec-pattern") || "**/*.glyph.json";
-        const specs = findChangedSpecs({
-            changedFiles: changed,
-            pattern,
-        });
-        core.info(`Detected ${specs.length} changed spec(s).`);
-        if (specs.length === 0) {
-            return;
-        }
+        const failOn = parseFailOn(core.getInput("fail-on"));
         const baseSha = pr.base.sha;
         const headSha = pr.head.sha;
-        // Wire the `glyph-version` action input. When set, shell out via
-        // `npx -y @glyph/cli@<version>` so the workflow doesn't need a separate
-        // install step. "latest" or empty → assume `glyph` is already on PATH
-        // (the documented prereq for now).
-        const glyphVersion = core.getInput("glyph-version");
-        const glyphCmd = glyphVersion && glyphVersion !== "latest"
-            ? ["npx", "-y", `@glyph/cli@${glyphVersion}`]
-            : ["glyph"];
-        // One workspace per action run; subdirs per spec keep image renders from
-        // colliding when a PR touches more than one chart. Cleaned in `finally`
-        // below so self-hosted runners don't accumulate per-PR detritus.
-        const workRoot = (0,external_node_fs_namespaceObject.mkdtempSync)((0,external_node_path_namespaceObject.join)((0,external_node_os_namespaceObject.tmpdir)(), "glyph-audit-"));
-        // Validate `comment-mode` early so a typo surfaces as a clear failure
-        // instead of being silently coerced to `new` downstream. The default in
-        // `action.yml` is `sticky`, so empty-string here also resolves to sticky.
+        // Validate comment-mode early so a typo surfaces as a clear failure
+        // instead of being silently coerced. Default is sticky.
         const commentModeInput = (core.getInput("comment-mode") || "sticky").trim();
         if (commentModeInput !== "sticky" && commentModeInput !== "new") {
             core.warning(`Unknown comment-mode "${commentModeInput}" — falling back to "sticky". ` +
                 'Valid values: "sticky" | "new".');
         }
         const commentMode = commentModeInput === "new" ? "new" : "sticky";
-        // Accumulator: one section of markdown per successfully-processed spec.
-        // We emit ONE comment per run (sticky-upsert or new-create) at the end —
-        // not one per spec — so a PR touching 5 charts produces 1 comment, not 5.
+        // 1. Enumerate every spec at HEAD that matches the pattern. This is the
+        //    list we audit — broader than v0.1.0's "changed files only", which
+        //    silently dropped new specs (the most common case for adopters
+        //    incrementally adding charts to a project).
+        const specPaths = await listSpecsAtRef(octokit, owner, repo, headSha, pattern);
+        core.info(`Found ${specPaths.length} spec(s) matching "${pattern}" at HEAD.`);
+        if (specPaths.length === 0) {
+            // Nothing to audit — skip the comment entirely. A "0 charts" comment
+            // would be noise on PRs that don't touch chart specs.
+            core.info("No matching specs — skipping audit + comment.");
+            return;
+        }
+        const allFindings = [];
         const sections = [];
-        try {
-            for (const spec of specs) {
+        for (const path of specPaths) {
+            try {
+                // Fetch head version (must exist since we just listed it).
+                const headContent = await fetchFileAtRef(octokit, owner, repo, headSha, path);
+                if (headContent === null) {
+                    // Race condition: spec disappeared between listing and fetch.
+                    // Unusual but recoverable — just skip the spec.
+                    core.warning(`Spec ${path} disappeared between listing and fetch — skipping.`);
+                    continue;
+                }
+                let headSpec;
                 try {
-                    const safeName = spec.path.replace(/[^\w.-]+/g, "_");
-                    const specWorkDir = (0,external_node_path_namespaceObject.join)(workRoot, safeName);
-                    await external_node_fs_namespaceObject.promises.mkdir(specWorkDir, { recursive: true });
-                    const basePath = (0,external_node_path_namespaceObject.join)(specWorkDir, "base.json");
-                    const headPath = (0,external_node_path_namespaceObject.join)(specWorkDir, "head.json");
-                    const imageDir = (0,external_node_path_namespaceObject.join)(specWorkDir, "images");
-                    const baseContent = await fetchFileAtRef(octokit, owner, repo, baseSha, spec.path);
-                    const headContent = await fetchFileAtRef(octokit, owner, repo, headSha, spec.path);
-                    if (baseContent === null) {
-                        // New spec — no base to diff against. PR4 will widen this to a
-                        // "new chart" preview; for PR3 we just log + skip.
-                        core.info(`Spec ${spec.path} is new on this PR — skipping diff (no base).`);
-                        continue;
-                    }
-                    if (headContent === null) {
-                        // Spec was deleted on the PR — nothing to render.
-                        core.info(`Spec ${spec.path} was deleted on this PR — skipping.`);
-                        continue;
-                    }
-                    await external_node_fs_namespaceObject.promises.writeFile(basePath, baseContent, "utf8");
-                    await external_node_fs_namespaceObject.promises.writeFile(headPath, headContent, "utf8");
-                    const render = await renderSpecDiff({
-                        path: spec.path,
-                        base: basePath,
-                        head: headPath,
-                        glyphCmd,
-                        imageDir,
-                        exec: exec.getExecOutput,
-                    });
-                    // Upload the rendered SVGs to the orphan `.glyph-audit` branch and
-                    // rewrite the local-path references inside the CLI's markdown to
-                    // point at the resulting raw URLs. PR5 will use this rewritten
-                    // markdown as the sticky-comment body. We do this even when no
-                    // images came back so the comment still renders (it just won't
-                    // have a Render section).
-                    let markdown = render.markdown;
-                    if (render.imagePaths.length > 0) {
-                        const urls = await uploadSvgsToBranch({
-                            octokit,
-                            owner,
-                            repo,
-                            branch: AUDIT_BRANCH,
-                            commitSha: headSha,
-                            svgPaths: render.imagePaths,
-                        });
-                        // The CLI emits markdown like `![alt](before.svg)` with
-                        // basename-only refs (the image-dir is its own scope). We MUST
-                        // anchor the rewrite to the markdown image-link form `](X)` —
-                        // a substring `before.svg` could otherwise show up in a JSON
-                        // diff line, a code fence, or the user's own spec path (e.g.
-                        // `charts/before.svg.glyph.json`) and would be incorrectly
-                        // clobbered into a raw URL.
-                        for (const [local, url] of Object.entries(urls)) {
-                            const base = local.split("/").pop();
-                            // Replace `](basename)` → `](url)` and `](abs/path)` → `](url)`.
-                            // Anchoring on the `](...)` enclosure prevents collateral hits.
-                            markdown = replaceMarkdownLinkTarget(markdown, local, url);
-                            if (base) {
-                                markdown = replaceMarkdownLinkTarget(markdown, base, url);
-                            }
-                        }
-                        core.info(`Uploaded ${render.imagePaths.length} image(s) to ${AUDIT_BRANCH}.`);
-                    }
-                    else {
-                        core.info(`No images rendered for ${spec.path}; comment will be text-only.`);
-                    }
-                    core.info(`--- glyph diff for ${spec.path} ---`);
-                    core.info(markdown);
-                    // Accumulate; the comment is upserted ONCE after the loop. We
-                    // include the spec path as a `<h2>` so multi-chart PRs get a
-                    // navigable, scannable comment instead of a wall of diffs.
-                    sections.push(`## \`${spec.path}\`\n\n${markdown}`);
+                    headSpec = JSON.parse(headContent);
                 }
-                catch (specErr) {
-                    // One spec failing shouldn't kill the whole action — we want the
-                    // remaining specs in the PR to still produce comments.
-                    core.warning(`Failed to render diff for ${spec.path}: ` +
-                        (specErr instanceof Error ? specErr.message : String(specErr)));
+                catch (parseErr) {
+                    core.warning(`Spec ${path} is not valid JSON — skipping audit. ` +
+                        (parseErr instanceof Error ? parseErr.message : String(parseErr)));
+                    continue;
                 }
+                if (typeof headSpec !== "object" || headSpec === null) {
+                    core.warning(`Spec ${path} did not parse to an object — skipping.`);
+                    continue;
+                }
+                // 2. Diff is BEST-EFFORT. If the file is new on this PR (404 on
+                //    base) we render the audit section only and skip the diff.
+                let diff = null;
+                const baseContent = await fetchFileAtRef(octokit, owner, repo, baseSha, path);
+                if (baseContent !== null) {
+                    try {
+                        const baseSpec = JSON.parse(baseContent);
+                        diff = diffSpecs(baseSpec, headSpec);
+                    }
+                    catch (parseErr) {
+                        // Base parse failure shouldn't kill the audit — just drop the diff.
+                        core.warning(`Base version of ${path} is not valid JSON — diff section skipped. ` +
+                            (parseErr instanceof Error ? parseErr.message : String(parseErr)));
+                    }
+                }
+                // 3. Audit. We don't have row/color cardinality at action time
+                //    (those'd come from the materializer); the action audits
+                //    structural/schema rules only.
+                const findings = auditSpec({ spec: headSpec });
+                allFindings.push(...findings);
+                sections.push(renderSpecSection({ path, diff, findings }));
+            }
+            catch (specErr) {
+                // One spec failing shouldn't kill the whole action.
+                core.warning(`Failed to audit ${path}: ` +
+                    (specErr instanceof Error ? specErr.message : String(specErr)));
             }
         }
-        finally {
-            // Best-effort tmpdir cleanup. GitHub-hosted runners GC per-job, but
-            // self-hosted runners would otherwise accumulate one workspace per PR.
-            await external_node_fs_namespaceObject.promises.rm(workRoot, { recursive: true, force: true }).catch(() => {
-                // Ignore — cleanup is best-effort.
-            });
-        }
-        // Skip the comment entirely when EVERY spec failed — there's nothing
-        // useful to post, and a "0 charts rendered" comment would be noise. The
-        // per-spec warnings already surfaced as Actions annotations.
         if (sections.length === 0) {
             core.info("No spec sections produced — skipping PR comment.");
             return;
         }
-        const header = `### Glyph chart audit\n\n` +
-            `Rendered **${sections.length}** chart spec${sections.length === 1 ? "" : "s"} ` +
-            `at \`${headSha.slice(0, 7)}\`.`;
+        const header = buildHeader({
+            sectionCount: sections.length,
+            headSha,
+            findingCount: allFindings.length,
+        });
         const body = [header, ...sections].join("\n\n---\n\n");
         await upsertComment({
             octokit,
@@ -34581,37 +34941,70 @@ async function run() {
             body,
             mode: commentMode,
         });
+        // 4. Fail at the END so the comment lands first. Adopters with
+        //    `fail-on: error` still see the audit report on a red build.
+        if (shouldFail(allFindings, failOn)) {
+            core.setFailed(failureReason(allFindings, failOn));
+        }
     }
     catch (err) {
         core.setFailed(err instanceof Error ? err.message : String(err));
     }
 }
 /**
+ * Build the comment header — one line per run, naming the count of specs
+ * we audited and the head SHA the report was computed against.
+ */
+function buildHeader(args) {
+    const s = args.sectionCount === 1 ? "" : "s";
+    return (`### Glyph chart audit\n\n` +
+        `Audited **${args.sectionCount}** chart spec${s} at \`${args.headSha.slice(0, 7)}\` — ` +
+        `**${args.findingCount}** total finding${args.findingCount === 1 ? "" : "s"}.`);
+}
+/**
+ * List every file at `ref` that matches the spec glob. Uses the recursive
+ * git-tree API (one request for the whole repo). Trees > 100k entries
+ * come back truncated; in that case we'd need a different strategy, but
+ * a repo that big with `.glyph.json` files all over is not the v0.2
+ * target user. We surface the truncation as a warning so it's visible.
+ */
+async function listSpecsAtRef(octokit, owner, repo, ref, pattern) {
+    const tree = await octokit.rest.git.getTree({
+        owner,
+        repo,
+        tree_sha: ref,
+        recursive: "true",
+    });
+    if (tree.data.truncated) {
+        core.warning(`Git tree at ${ref.slice(0, 7)} was truncated by GitHub — some specs may be missing ` +
+            `from the audit. Repos with > ~100k entries need a different listing strategy.`);
+    }
+    const files = tree.data.tree
+        .filter((entry) => entry.type === "blob" && typeof entry.path === "string")
+        .map((entry) => entry.path);
+    return files.filter((p) => matchesPattern(p, pattern)).sort();
+}
+/**
  * Fetch a file's contents at a specific ref via the GitHub contents API.
  * Returns `null` when the file doesn't exist at that ref (e.g. it was added
- * on the PR, so it doesn't exist on the base SHA, or was deleted on the head).
+ * on the PR, so it doesn't exist on the base SHA).
  */
 async function fetchFileAtRef(octokit, owner, repo, ref, path) {
     try {
         const res = await octokit.rest.repos.getContent({ owner, repo, ref, path });
         const data = res.data;
-        // getContent returns an array for directories — defensive narrow.
         if (Array.isArray(data)) {
             throw new Error(`Path ${path} resolved to a directory at ref ${ref}.`);
         }
         if (data.type !== "file") {
             throw new Error(`Path ${path} is not a file at ref ${ref} (type=${data.type}).`);
         }
-        // Files come back base64-encoded by default; "encoding" is always "base64"
-        // for the contents endpoint but we check defensively.
         if (data.encoding !== "base64") {
             throw new Error(`Unexpected encoding ${data.encoding} for ${path}@${ref}; expected base64.`);
         }
         return Buffer.from(data.content, "base64").toString("utf8");
     }
     catch (err) {
-        // 404 = file doesn't exist at this ref; surface as null so the caller
-        // can decide (new-file vs deleted-file).
         if (err !== null &&
             typeof err === "object" &&
             "status" in err &&
